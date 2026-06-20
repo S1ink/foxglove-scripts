@@ -26,28 +26,16 @@ export const output = "/lidar_image";
 // ─── Configuration ────────────────────────────────────────────────────────────
 const CONFIG = {
   // ── Resolution ───────────────────────────────────────────────────────────
-  // Set DYNAMIC_RESOLUTION: true  → image size is computed each frame from
-  //                                  the data's angular extent and point density.
-  // Set DYNAMIC_RESOLUTION: false → fixed OUTPUT_WIDTH × OUTPUT_HEIGHT pixels.
-  DYNAMIC_RESOLUTION: false,
-  OUTPUT_WIDTH: 512, // pixels  (ignored when DYNAMIC_RESOLUTION: true)
-  OUTPUT_HEIGHT: 128, // pixels  (ignored when DYNAMIC_RESOLUTION: true)
-
-  // ── Angular FOV (radians) ────────────────────────────────────────────────
-  // Used only when DYNAMIC_RESOLUTION: false.
-  //   Full 360° spinning LiDAR  →  H_FOV = 2π,  V_FOV = ~0.52 (30°)
-  //   Solid-state / narrow FOV  →  set smaller values to fit your sensor
-  H_FOV: 2 * Math.PI, // horizontal  (0 < H_FOV ≤ 2π)
-  V_FOV: 1.57079632679, // vertical
-  //
-  // Azimuth zero maps to the left edge; elevation zero maps to image centre.
-  // A full 360° sweep wraps so that azimuth –π and +π share the same column.
+  // If OUTPUT_WIDTH = 0, both width and height are dynamically determined,
+  // otherwise, output width is locked and height is determined by fov aspect
+  // ratio of data
+  OUTPUT_WIDTH: 360, // pixels
 
   // Rotates the azimuth before binning, in radians. Use this when the
   // sensor is mounted at an angle relative to the vehicle/robot frame, so
   // "straight ahead" lines up with the centre/edge of the image as expected.
   // Positive values rotate counter-clockwise (right-hand rule about +z).
-  AZIMUTH_OFFSET: 1.57079632679,
+  AZIMUTH_OFFSET: 1.57079632679, //3.66519142919,
 
   // ── Display field ────────────────────────────────────────────────────────
   // Which point value gets mapped to pixel colour.
@@ -57,21 +45,21 @@ const CONFIG = {
   //              e.g. "intensity", "reflectivity", "ring", "time". Uses
   //              VALUE_MIN / VALUE_MAX below for scaling. If the field
   //              doesn't exist on the cloud, falls back to "depth".
-  VALUE_FIELD: "depth" as string,
-
-  // Pixel-value scaling range when VALUE_FIELD is "depth".
-  // These also define pixel value 0 (MIN_DEPTH) and 65535/white (MAX_DEPTH).
-  MIN_DEPTH: 0,
-  MAX_DEPTH: 6,
-  DEPTH_RESCALE_POWER: 1,
+  VALUE_FIELD: "intensity" as string,
 
   // Pixel-value scaling range when VALUE_FIELD is anything other than
   // "depth" (e.g. intensity/reflectivity units, sensor-specific).
   // Set VALUE_MIN === VALUE_MAX to auto-range per-frame from the data
   // instead of fixed bounds (handy since intensity/reflectivity scales
   // vary a lot between sensors).
-  VALUE_MIN: 0,
-  VALUE_MAX: 0,
+  VALUE_MIN: 30000,
+  VALUE_MAX: 65535,
+  VALUE_RESCALE_POWER: 2,
+
+  // Pixel-value scaling range when VALUE_FIELD is "depth".
+  // These also define pixel value 0 (MIN_DEPTH) and 65535/white (MAX_DEPTH).
+  MIN_DEPTH: 0,
+  MAX_DEPTH: 0,
 
   // ── Output encoding ──────────────────────────────────────────────────────
   // "mono16"  – 16-bit greyscale, little-endian; best for downstream processing.
@@ -91,13 +79,11 @@ const CONFIG = {
   // dynamic resolution pass picks an image height taller than the real
   // number of layers. When true, blank rows are filled by linearly
   // interpolating the displayed value, per column, between the nearest
-  // filled row above and below. Only applied when DYNAMIC_RESOLUTION is true.
-  INTERPOLATE_GAPS: true,
-
+  // filled row above and below.
   // Largest blank run (in rows) that will be bridged. Set to Infinity to
   // always interpolate, or lower this to avoid bridging large real gaps
   // (e.g. missing returns at the top/bottom of a narrow FOV).
-  MAX_GAP_ROWS: 4,
+  MAX_GAP_INTERPOLATION_ROWS: Infinity,
 } as const;
 
 /** Encoding string to bytes/pixel */
@@ -296,12 +282,10 @@ export default function script(
 
     // The displayed value: depth itself, or a separate field read straight
     // from the point's bytes.
-    let val: number;
+    let val: number = depth;
     if (valueFieldResolved && valueField != null) {
       val = readScalar(view, base + valueField.offset, valueField.datatype, le);
       if (!isFinite(val)) continue;
-    } else {
-      val = Math.pow(depth, CONFIG.DEPTH_RESCALE_POWER);
     }
 
     azBuf[valid] = az;
@@ -346,24 +330,20 @@ export default function script(
   let azOrigin: number, azRange: number;
   let elOrigin: number, elRange: number;
 
-  if (CONFIG.DYNAMIC_RESOLUTION) {
-    // Fit window exactly to this frame's data
-    azOrigin = minAz;
-    azRange = Math.max(maxAz - minAz, 1e-6);
-    elOrigin = minEl;
-    elRange = Math.max(maxEl - minEl, 1e-6);
+  // Fit window exactly to this frame's data
+  azOrigin = minAz;
+  azRange = Math.max(maxAz - minAz, 1e-6);
+  elOrigin = minEl;
+  elRange = Math.max(maxEl - minEl, 1e-6);
 
-    // Target roughly 1 point per output pixel, respect a sensible aspect ratio
-    const aspect = azRange / elRange;
+  // Target roughly 1 point per output pixel, respect a sensible aspect ratio
+  const aspect = azRange / elRange;
+  if (CONFIG.OUTPUT_WIDTH) {
+    outW = CONFIG.OUTPUT_WIDTH;
+    outH = Math.floor(outW / aspect);
+  } else {
     outH = Math.max(16, Math.min(1024, Math.round(Math.sqrt(valid / aspect))));
     outW = Math.max(16, Math.min(4096, Math.round(outH * aspect)));
-  } else {
-    outW = CONFIG.OUTPUT_WIDTH;
-    outH = CONFIG.OUTPUT_HEIGHT;
-    azOrigin = -CONFIG.H_FOV / 2; // centre azimuth at 0°
-    azRange = CONFIG.H_FOV;
-    elOrigin = -CONFIG.V_FOV / 2; // centre elevation at 0°
-    elRange = CONFIG.V_FOV;
   }
 
   // Guard against a degenerate frame where every point has the same value.
@@ -416,8 +396,13 @@ export default function script(
   // ── 5. Pass 3 – bridge blank rows left by sparse vertical layers ────────
   // Only meaningful in dynamic-resolution mode, where the chosen image
   // height is rarely an exact multiple of the sensor's real layer count.
-  if (CONFIG.INTERPOLATE_GAPS) {
-    interpolateColumnGaps(valuePx, outW, outH, CONFIG.MAX_GAP_ROWS);
+  if (CONFIG.MAX_GAP_INTERPOLATION_ROWS > 0) {
+    interpolateColumnGaps(
+      valuePx,
+      outW,
+      outH,
+      CONFIG.MAX_GAP_INTERPOLATION_ROWS,
+    );
   }
 
   // ── 6. Pass 4 – encode the value buffer into the output image format ───
@@ -432,7 +417,10 @@ export default function script(
     if (isNaN(val)) continue; // leave pixel as 0 (background); buffer is zero-initialised
 
     // Normalise to [0, 1] for encoding
-    const t = Math.max(0.0, Math.min(1.0, (val - valueMin) / valueRange));
+    const t = Math.pow(
+      Math.max(0.0, Math.min(1.0, (val - valueMin) / valueRange)),
+      CONFIG.VALUE_RESCALE_POWER,
+    );
 
     if (CONFIG.ENCODING === "rgb8") {
       // False-colour: Jet colourmap (blue = low, red = high)
